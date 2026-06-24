@@ -371,6 +371,14 @@ io.on('connection', (socket) => {
     await game.respondInvite(socket, user, data || {});
   });
 
+  socket.on('chat_message', async (data) => {
+    await game.sendChatMessage(socket, user, data || {});
+  });
+
+  socket.on('emoji_reaction', async (data) => {
+    await game.sendEmojiReaction(socket, user, data || {});
+  });
+
   socket.on('disconnect', async () => {
     console.log(`[disconnect] user=${user.id} ${user.username} sid=${socket.id}`);
     await game.unregisterSocket(socket);

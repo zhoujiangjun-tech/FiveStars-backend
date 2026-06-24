@@ -715,6 +715,59 @@ async function respondInvite(socket, user, { fromUserId, accept }) {
   }
 }
 
+// === 聊天与表情 ===
+async function getUserActiveGame(userId) {
+  const row = await db.get(
+    `SELECT id FROM games WHERE (player_black_id = ? OR player_white_id = ?) AND status = 'playing'`,
+    userId, userId
+  );
+  return row || null;
+}
+
+async function sendChatMessage(socket, user, { gameId, text }) {
+  if (!text || typeof text !== 'string' || !text.trim()) {
+    socket.emit('error', { message: '消息不能为空' });
+    return;
+  }
+  const g = await getGame(gameId || 0);
+  if (!g) { socket.emit('error', { message: '对局不存在' }); return; }
+  if (g.status !== 'playing') { socket.emit('error', { message: '对局已结束' }); return; }
+  const oppId = getOpponentId(g, user.id);
+  if (!oppId) { socket.emit('error', { message: '未找到对手' }); return; }
+  const msg = {
+    fromId: user.id,
+    fromUsername: user.username,
+    text: text.trim().slice(0, 200),
+    time: Date.now(),
+  };
+  // 发送给自己
+  socket.emit('chat_message', msg);
+  // 发送给对手
+  const oppSock = getSocketByUserId(oppId);
+  if (oppSock) oppSock.emit('chat_message', msg);
+}
+
+async function sendEmojiReaction(socket, user, { gameId, emoji }) {
+  if (!emoji || typeof emoji !== 'string') {
+    socket.emit('error', { message: '表情无效' });
+    return;
+  }
+  const g = await getGame(gameId || 0);
+  if (!g) { socket.emit('error', { message: '对局不存在' }); return; }
+  if (g.status !== 'playing') { socket.emit('error', { message: '对局已结束' }); return; }
+  const oppId = getOpponentId(g, user.id);
+  if (!oppId) { socket.emit('error', { message: '未找到对手' }); return; }
+  const payload = {
+    fromId: user.id,
+    fromUsername: user.username,
+    emoji: emoji.slice(0, 10),
+    time: Date.now(),
+  };
+  socket.emit('emoji_reaction', payload);
+  const oppSock = getSocketByUserId(oppId);
+  if (oppSock) oppSock.emit('emoji_reaction', payload);
+}
+
 module.exports = {
   BOARD_SIZE,
   registerSocket,
@@ -739,4 +792,6 @@ module.exports = {
   getGame,
   buildBoard,
   checkWin,
+  sendChatMessage,
+  sendEmojiReaction,
 };
