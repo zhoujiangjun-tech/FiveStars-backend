@@ -6,7 +6,7 @@ const db = require('./db');
 const JWT_SECRET = process.env.JWT_SECRET || 'fivestars_secret_key_change_me';
 const JWT_EXPIRES_IN = '7d';
 
-function register(username, password) {
+async function register(username, password) {
   if (!username || !password) {
     throw new Error('用户名和密码不能为空');
   }
@@ -17,16 +17,17 @@ function register(username, password) {
     throw new Error('密码长度至少 6 位');
   }
 
-  const existing = db.prepare('SELECT id FROM users WHERE username = ?').get(username);
+  const existing = await db.get('SELECT id FROM users WHERE username = ?', username);
   if (existing) {
     throw new Error('用户名已存在');
   }
 
   const password_hash = bcrypt.hashSync(password, 10);
-  const friend_code = db.generateUniqueCode();
-  const result = db
-    .prepare('INSERT INTO users (username, password_hash, friend_code) VALUES (?, ?, ?)')
-    .run(username, password_hash, friend_code);
+  const friend_code = await db.generateUniqueCode();
+  const result = await db.run(
+    'INSERT INTO users (username, password_hash, friend_code) VALUES (?, ?, ?)',
+    username, password_hash, friend_code
+  );
 
   const user = { id: result.lastInsertRowid, username, friendCode: friend_code };
   const token = jwt.sign({ id: user.id, username: user.username }, JWT_SECRET, {
@@ -35,11 +36,11 @@ function register(username, password) {
   return { token, user };
 }
 
-function login(username, password) {
+async function login(username, password) {
   if (!username || !password) {
     throw new Error('用户名和密码不能为空');
   }
-  const row = db.prepare('SELECT * FROM users WHERE username = ?').get(username);
+  const row = await db.get('SELECT * FROM users WHERE username = ?', username);
   if (!row) {
     throw new Error('用户名或密码错误');
   }

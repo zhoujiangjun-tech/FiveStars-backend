@@ -15,11 +15,6 @@ const server = http.createServer(app);
 app.use(cors());
 app.use(express.json());
 
-// 启动时确保旧用户有 friend_code
-db.ensureCodes();
-
-// ============ HTTP API ============
-
 // 简易请求日志
 app.use((req, res, next) => {
   console.log(`[http] ${req.method} ${req.url} from ${req.ip || req.headers['x-forwarded-for'] || req.socket.remoteAddress}`);
@@ -28,14 +23,26 @@ app.use((req, res, next) => {
 
 // 健康检查
 app.get('/', (req, res) => {
-  res.json({ ok: true, app: '五星连珠' });
+  res.json({ ok: true, app: '五星连珠', online: onlineUserIds.size });
+});
+
+// 调试接口:看自己 + 队列长度
+app.get('/api/debug/match-state', authMiddleware, (req, res) => {
+  const me = req.user.id;
+  res.json({
+    me: { id: me, username: req.user.username },
+    onlineCount: onlineUserIds.size,
+    waitingQueueSize: game.waitingQueueSize(),
+    inQueue: game.isInQueue(me),
+    serverTime: Date.now(),
+  });
 });
 
 // 注册
-app.post('/api/auth/register', (req, res) => {
+app.post('/api/auth/register', async (req, res) => {
   try {
     const { username, password } = req.body || {};
-    const result = register(username, password);
+    const result = await register(username, password);
     res.json(result);
   } catch (e) {
     res.status(400).json({ error: e.message });
@@ -43,10 +50,10 @@ app.post('/api/auth/register', (req, res) => {
 });
 
 // 登录
-app.post('/api/auth/login', (req, res) => {
+app.post('/api/auth/login', async (req, res) => {
   try {
     const { username, password } = req.body || {};
-    const result = login(username, password);
+    const result = await login(username, password);
     res.json(result);
   } catch (e) {
     res.status(400).json({ error: e.message });
@@ -54,20 +61,19 @@ app.post('/api/auth/login', (req, res) => {
 });
 
 // 当前用户历史对局
-app.get('/api/games/my', authMiddleware, (req, res) => {
+app.get('/api/games/my', authMiddleware, async (req, res) => {
   const uid = req.user.id;
-  const rows = db
-    .prepare(
-      `SELECT g.id, g.player_black_id, g.player_white_id, g.status, g.winner_id, g.created_at, g.finished_at,
-              ub.username AS black_username, uw.username AS white_username
-         FROM games g
-         LEFT JOIN users ub ON ub.id = g.player_black_id
-         LEFT JOIN users uw ON uw.id = g.player_white_id
-        WHERE g.player_black_id = ? OR g.player_white_id = ?
-        ORDER BY g.id DESC
-        LIMIT 100`
-    )
-    .all(uid, uid);
+  const rows = await db.all(
+    `SELECT g.id, g.player_black_id, g.player_white_id, g.status, g.winner_id, g.created_at, g.finished_at,
+            ub.username AS black_username, uw.username AS white_username
+       FROM games g
+       LEFT JOIN users ub ON ub.id = g.player_black_id
+       LEFT JOIN users uw ON uw.id = g.player_white_id
+      WHERE g.player_black_id = ? OR g.player_white_id = ?
+      ORDER BY g.id DESC
+      LIMIT 100`,
+    uid, uid
+  );
 
   const list = rows.map((r) => {
     let resultText = '进行中';
@@ -92,16 +98,16 @@ app.get('/api/games/my', authMiddleware, (req, res) => {
 });
 
 // 单局详情
-app.get('/api/games/:id', authMiddleware, (req, res) => {
+app.get('/api/games/:id', authMiddleware, async (req, res) => {
   const uid = req.user.id;
   const id = parseInt(req.params.id, 10);
-  const g = game.getGame(id);
+  const g = await game.getGame(id);
   if (!g) return res.status(404).json({ error: '对局不存在' });
   if (g.player_black_id !== uid && g.player_white_id !== uid) {
     return res.status(403).json({ error: '无权查看该对局' });
   }
-  const black = db.prepare('SELECT id, username FROM users WHERE id = ?').get(g.player_black_id);
-  const white = db.prepare('SELECT id, username FROM users WHERE id = ?').get(g.player_white_id);
+  const black = await db.get('SELECT id, username FROM users WHERE id = ?', g.player_black_id);
+  const white = await db.get('SELECT id, username FROM users WHERE id = ?', g.player_white_id);
   res.json({
     id: g.id,
     black,
@@ -119,36 +125,29 @@ app.get('/api/games/:id', authMiddleware, (req, res) => {
 });
 
 // 用户战绩
-app.get('/api/user/stats', authMiddleware, (req, res) => {
+app.get('/api/user/stats', authMiddleware, async (req, res) => {
   const uid = req.user.id;
-  const total = db
-    .prepare(
-      `SELECT COUNT(*) AS c FROM games WHERE player_black_id = ? OR player_white_id = ?`
-    )
-    .get(uid, uid).c;
+  const totalRow = await db.get(
+    `SELECT COUNT(*) AS c FROM games WHERE player_black_id = ? OR player_white_id = ?`,
+    uid, uid
+  );
+  const winsRow = await db.get(
+    `SELECT COUNT(*) AS c FROM games WHERE winner_id = ?`,
+    uid
+  );
+  const lossesRow = await db.get(
+    `SELECT COUNT(*) AS c FROM games
+      WHERE status = 'finished' AND winner_id IS NOT NULL AND winner_id != ?
+        AND (player_black_id = ? OR player_white_id = ?)`,
+    uid, uid, uid
+  );
+  const drawsRow = await db.get(
+    `SELECT COUNT(*) AS c FROM games
+      WHERE status = 'draw' AND (player_black_id = ? OR player_white_id = ?)`,
+    uid, uid
+  );
 
-  const wins = db
-    .prepare(
-      `SELECT COUNT(*) AS c FROM games WHERE winner_id = ?`
-    )
-    .get(uid).c;
-
-  const losses = db
-    .prepare(
-      `SELECT COUNT(*) AS c FROM games
-        WHERE status = 'finished' AND winner_id IS NOT NULL AND winner_id != ?
-          AND (player_black_id = ? OR player_white_id = ?)`
-    )
-    .get(uid, uid, uid).c;
-
-  const draws = db
-    .prepare(
-      `SELECT COUNT(*) AS c FROM games
-        WHERE status = 'draw' AND (player_black_id = ? OR player_white_id = ?)`
-    )
-    .get(uid, uid).c;
-
-  const user = db.prepare('SELECT id, username, friend_code, created_at FROM users WHERE id = ?').get(uid);
+  const user = await db.get('SELECT id, username, friend_code, created_at FROM users WHERE id = ?', uid);
   res.json({
     user: user ? {
       id: user.id,
@@ -156,23 +155,30 @@ app.get('/api/user/stats', authMiddleware, (req, res) => {
       friendCode: user.friend_code,
       createdAt: user.created_at,
     } : null,
-    total,
-    wins,
-    losses,
-    draws
+    total: totalRow?.c || 0,
+    wins: winsRow?.c || 0,
+    losses: lossesRow?.c || 0,
+    draws: drawsRow?.c || 0,
   });
 });
 
 // ============ 好友系统 REST API ============
 
-// 搜索用户（按好友码）
-app.get('/api/users/search', authMiddleware, (req, res) => {
+// 搜索用户
+app.get('/api/users/search', authMiddleware, async (req, res) => {
   try {
-    const code = req.query.code;
+    const code = String(req.query.code || '').trim();
     const me = req.user.id;
-    const u = friends.searchByCode(code, me);
+    let u = null;
+    if (/^\d{6}$/.test(code)) {
+      u = await friends.searchByCode(code, me);
+    } else if (code.length > 0) {
+      u = await friends.searchByUsername(code, me);
+    } else {
+      return res.status(400).json({ error: '请输入 6 位好友码或用户名' });
+    }
     if (!u) return res.json({ user: null });
-    const isFriend = friends.isFriend(me, u.id);
+    const isFriend = await friends.isFriend(me, u.id);
     res.json({ user: u, isFriend });
   } catch (e) {
     res.status(400).json({ error: e.message });
@@ -180,25 +186,20 @@ app.get('/api/users/search', authMiddleware, (req, res) => {
 });
 
 // 发送好友请求
-app.post('/api/friends/request', (req, res, next) => {
-  authMiddleware(req, res, () => handleSendFriendRequest(req, res));
-});
-
-function handleSendFriendRequest(req, res) {
+app.post('/api/friends/request', authMiddleware, async (req, res) => {
   try {
     const { code, toUserId } = req.body || {};
     let targetId = toUserId;
     if (!targetId && code) {
-      const u = friends.searchByCode(code, req.user.id);
+      const u = await friends.searchByCode(code, req.user.id);
       if (!u) return res.status(404).json({ error: '用户不存在' });
       targetId = u.id;
     }
     if (!targetId) return res.status(400).json({ error: '缺少 code 或 toUserId' });
-    const result = friends.sendRequest(req.user.id, targetId);
-    // 异步通知对方（不阻塞响应）
+    const result = await friends.sendRequest(req.user.id, targetId);
     if (global.__io) {
       const targetIdNum = targetId;
-      const fromCode = db.prepare('SELECT friend_code FROM users WHERE id = ?').get(req.user.id)?.friend_code;
+      const fromCode = (await db.get('SELECT friend_code FROM users WHERE id = ?', req.user.id))?.friend_code;
       global.__io.fetchSockets().then((sockets) => {
         let delivered = false;
         for (const s of sockets) {
@@ -215,28 +216,25 @@ function handleSendFriendRequest(req, res) {
       }).catch((e) => {
         console.log('[friend_request] emit error:', e.message);
       });
-    } else {
-      console.log('[friend_request] global.__io not set');
     }
     res.json(result);
   } catch (e) {
     res.status(400).json({ error: e.message });
   }
-}
+});
 
 // 收到的好友请求
-app.get('/api/friends/requests', authMiddleware, (req, res) => {
-  const list = friends.getIncomingRequests(req.user.id);
+app.get('/api/friends/requests', authMiddleware, async (req, res) => {
+  const list = await friends.getIncomingRequests(req.user.id);
   res.json({ requests: list });
 });
 
 // 响应好友请求
-app.post('/api/friends/respond', authMiddleware, (req, res) => {
+app.post('/api/friends/respond', authMiddleware, async (req, res) => {
   try {
     const { id, accept } = req.body || {};
     if (!id) return res.status(400).json({ error: '缺少 id' });
-    const result = friends.respondRequest(req.user.id, parseInt(id, 10), !!accept);
-    // 通知请求方
+    const result = await friends.respondRequest(req.user.id, parseInt(id, 10), !!accept);
     if (global.__io) {
       global.__io.fetchSockets().then((sockets) => {
         for (const s of sockets) {
@@ -257,36 +255,25 @@ app.post('/api/friends/respond', authMiddleware, (req, res) => {
 });
 
 // 好友列表
-app.get('/api/friends', authMiddleware, (req, res) => {
-  const list = friends.listFriends(req.user.id);
-  // 是否在线
-  const ids = new Set(list.map((f) => f.id));
-  let onlineIds = new Set();
-  if (global.__io) {
-    global.__io.fetchSockets().then((sockets) => {
-      const next = new Set(sockets.map((s) => s.user?.id).filter(Boolean));
-      // 同步响应里附上
-    }).catch(() => {});
-  }
+app.get('/api/friends', authMiddleware, async (req, res) => {
+  const list = await friends.listFriends(req.user.id);
   res.json({ friends: list });
 });
 
 // 删除好友
-app.delete('/api/friends/:id', authMiddleware, (req, res) => {
+app.delete('/api/friends/:id', authMiddleware, async (req, res) => {
   try {
     const fid = parseInt(req.params.id, 10);
-    const r = friends.removeFriend(req.user.id, fid);
+    const r = await friends.removeFriend(req.user.id, fid);
     res.json(r);
   } catch (e) {
     res.status(400).json({ error: e.message });
   }
 });
 
-// 我的资料（含好友码）
-app.get('/api/user/me', authMiddleware, (req, res) => {
-  const row = db
-    .prepare('SELECT id, username, friend_code, created_at FROM users WHERE id = ?')
-    .get(req.user.id);
+// 我的资料
+app.get('/api/user/me', authMiddleware, async (req, res) => {
+  const row = await db.get('SELECT id, username, friend_code, created_at FROM users WHERE id = ?', req.user.id);
   if (!row) return res.status(404).json({ error: '用户不存在' });
   res.json({
     user: {
@@ -321,23 +308,19 @@ io.on('connection', (socket) => {
 
   console.log(`[connect] user=${user.id} ${user.username} sid=${socket.id}`);
   addOnline(user);
-  // 关键:新连接立即推送一次当前在线人数,这样刚加入的客户端不会一直显示 0
   socket.emit('online_count', { count: onlineUserIds.size });
 
-  socket.on('join_match', () => {
-    game.tryMatch(socket, user);
+  socket.on('join_match', async () => {
+    await game.tryMatch(socket, user);
   });
 
-  // 客户端进入对局屏幕后,显式通知服务端"我已经进入" -> 服务端开始记时,
-  // 且后续该用户断线才会被算作"比赛中离线"去通知对手(避免误报)
-  socket.on('join_game', ({ gameId } = {}) => {
+  socket.on('join_game', async ({ gameId } = {}) => {
     if (typeof gameId !== 'number') return;
     try {
-      const g = game.getGame(gameId);
+      const g = await game.getGame(gameId);
       if (!g) return;
       if (g.player_black_id !== user.id && g.player_white_id !== user.id) return;
       game.markUserJoinedGame(gameId, user.id);
-      // 通知客户端:这一局是否另一方已经进入(用于显示"对手正在进入"等)
       const opponentId = g.player_black_id === user.id ? g.player_white_id : g.player_black_id;
       const opReady = game.hasUserJoinedGame(gameId, opponentId);
       socket.emit('join_game_ack', { gameId, bothReady: opReady && game.hasUserJoinedGame(gameId, user.id) });
@@ -348,57 +331,56 @@ io.on('connection', (socket) => {
     game.cancelMatch(user.id);
   });
 
-  socket.on('make_move', (data) => {
-    game.makeMove(socket, user, data || {});
+  socket.on('make_move', async (data) => {
+    await game.makeMove(socket, user, data || {});
   });
 
-  socket.on('request_undo', (data) => {
-    game.requestUndo(socket, user, data || {});
+  socket.on('request_undo', async (data) => {
+    await game.requestUndo(socket, user, data || {});
   });
 
-  socket.on('undo_response', (data) => {
-    game.undoResponse(socket, user, data || {});
+  socket.on('undo_response', async (data) => {
+    await game.undoResponse(socket, user, data || {});
   });
 
-  socket.on('resign', (data) => {
-    game.resign(socket, user, data || {});
+  socket.on('resign', async (data) => {
+    await game.resign(socket, user, data || {});
   });
 
-  // 退出对局（对局中）
-  socket.on('exit_game', (data) => {
-    game.exitGame(socket, user, data || {});
+  socket.on('exit_game', async (data) => {
+    await game.exitGame(socket, user, data || {});
   });
 
-  // 再来一局
-  socket.on('request_rematch', (data) => {
-    game.requestRematch(socket, user, data || {});
-  });
-  socket.on('rematch_response', (data) => {
-    game.respondRematch(socket, user, data || {});
+  socket.on('request_rematch', async (data) => {
+    await game.requestRematch(socket, user, data || {});
   });
 
-  // 邀请好友对弈
-  socket.on('invite_friend', (data) => {
-    game.inviteToGame(socket, user, data || {});
+  socket.on('rematch_response', async (data) => {
+    await game.respondRematch(socket, user, data || {});
   });
+
+  socket.on('invite_friend', async (data) => {
+    await game.inviteToGame(socket, user, data || {});
+  });
+
   socket.on('cancel_invite', (data) => {
     game.cancelInvite(socket, user, data || {});
   });
-  socket.on('invite_response', (data) => {
-    game.respondInvite(socket, user, data || {});
+
+  socket.on('invite_response', async (data) => {
+    await game.respondInvite(socket, user, data || {});
   });
 
-  socket.on('disconnect', () => {
+  socket.on('disconnect', async () => {
     console.log(`[disconnect] user=${user.id} ${user.username} sid=${socket.id}`);
-    game.unregisterSocket(socket);
-    // 稍等一拍再移除，避免同一账号其它连接被误减
+    await game.unregisterSocket(socket);
     setTimeout(() => removeOnline(user), 100);
   });
 });
 
 // === 实时在线人数广播 ===
 const onlineUserIds = new Set();
-const onlineUserCounts = new Map(); // userId -> 已连接 socket 数（多端/多标签登录计数）
+const onlineUserCounts = new Map();
 
 function addOnline(user) {
   const before = onlineUserCounts.get(user.id) || 0;
@@ -415,7 +397,7 @@ function removeOnline(user) {
     onlineUserIds.delete(user.id);
   } else {
     onlineUserCounts.set(user.id, before - 1);
-    return; // 同一账号还有别的连接，账号仍在线
+    return;
   }
   broadcastOnlineCount();
 }
@@ -423,11 +405,13 @@ function broadcastOnlineCount() {
   io.emit('online_count', { count: onlineUserIds.size });
 }
 
-// === 鉴权中间件：未登录拒绝连接 ===
-
-
-// 默认使用 4800 端口（避开 3000/5173 已被占用的项目），可通过环境变量 PORT 自定义
+// 启动服务器
 const PORT = process.env.PORT || 4800;
-server.listen(PORT, '0.0.0.0', () => {
-  console.log(`五星连珠后端已启动，监听端口 ${PORT}`);
-});
+
+(async () => {
+  await db.initTables();
+  await db.ensureCodes();
+  server.listen(PORT, '0.0.0.0', () => {
+    console.log(`五星连珠后端已启动，监听端口 ${PORT}`);
+  });
+})();
