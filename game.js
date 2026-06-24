@@ -84,27 +84,39 @@ function inviteKey(a, b) { return a < b ? `${a}:${b}` : `${b}:${a}`; }
 // 内存中 socketId -> userId 的映射
 const socketUserMap = new Map();
 
-// 在线 socket 映射：userId -> socketId
+// 在线 socket 映射：userId -> Set<socketId>（支持多端/多标签登录）
 const userSocketMap = new Map();
 
 function registerSocket(socket, user) {
   socketUserMap.set(socket.id, user.id);
-  userSocketMap.set(user.id, socket.id);
+  if (!userSocketMap.has(user.id)) userSocketMap.set(user.id, new Set());
+  userSocketMap.get(user.id).add(socket.id);
 }
 
 function unregisterSocket(socket) {
   const userId = socketUserMap.get(socket.id);
   socketUserMap.delete(socket.id);
-  if (userId && userSocketMap.get(userId) === socket.id) {
-    userSocketMap.delete(userId);
+  // 优先从 userSocketMap 中移除当前 socket,然后判断用户是否还有别的连接
+  if (userId) {
+    const set = userSocketMap.get(userId);
+    if (set) {
+      set.delete(socket.id);
+      if (set.size === 0) userSocketMap.delete(userId);
+    }
   }
-  // 从等待队列中移除
+  // 从等待队列中移除该 socket(仅这一条,不影响其他连接的用户)
   for (let i = waitingQueue.length - 1; i >= 0; i--) {
     if (waitingQueue[i].socketId === socket.id) {
       waitingQueue.splice(i, 1);
     }
   }
-  // 用户下线时把 ta 作为接收方的邀请清掉，并向发起方通知
+  // 关键:用户还有别的连接(多端/重连中)就视为仍然在线,不要通知对手
+  // 也不要清理/取消任何 pending 邀请/悔棋请求,否则会出现误报
+  if (userId && isUserOnline(userId)) {
+    console.log(`[unregisterSocket] user=${userId} still has other connection, skip opponent notify`);
+    return;
+  }
+  // 用户真正下线时,先清理掉 ta 作为接收方的邀请和再来一局,并通知发起方
   for (const [k, v] of pendingInvites.entries()) {
     if (v.toId === userId) {
       pendingInvites.delete(k);
@@ -112,7 +124,6 @@ function unregisterSocket(socket) {
       if (fromSock) fromSock.emit('invite_cancelled', { reason: 'offline' });
     }
   }
-  // 清理用户作为接收方的再来一局请求
   for (const [k, v] of pendingRematch.entries()) {
     if (v.toId === userId) {
       pendingRematch.delete(k);
@@ -120,7 +131,7 @@ function unregisterSocket(socket) {
       if (fromSock) fromSock.emit('rematch_cancelled', { reason: 'offline' });
     }
   }
-  // 用户下线时,通知对局中的对手
+  // 用户真正下线时,通知对局中的对手
   if (userId) {
     try {
       const rows = db.prepare(
@@ -139,9 +150,24 @@ function unregisterSocket(socket) {
 }
 
 function getSocketByUserId(userId) {
-  const sid = userSocketMap.get(userId);
-  if (!sid) return null;
-  return global.__io?.sockets.sockets.get(sid) || null;
+  const set = userSocketMap.get(userId);
+  if (!set || set.size === 0) return null;
+  // 取任意一个有效的 socket
+  for (const sid of set) {
+    const s = global.__io?.sockets.sockets.get(sid);
+    if (s) return s;
+  }
+  return null;
+}
+
+// 用户当前是否至少有一个有效连接
+function isUserOnline(userId) {
+  const set = userSocketMap.get(userId);
+  if (!set || set.size === 0) return false;
+  for (const sid of set) {
+    if (global.__io?.sockets.sockets.get(sid)) return true;
+  }
+  return false;
 }
 
 // 落子后判断是否五连
@@ -228,10 +254,17 @@ function tryMatch(socket, user) {
     return;
   }
 
-  // 找一个不是自己的等待者
+  // 找一个不是自己的等待者，且其 socket 仍然有效
   for (let i = 0; i < waitingQueue.length; i++) {
     const w = waitingQueue[i];
     if (w.userId === user.id) continue;
+    // 关键:等待者可能已经断线,跳过陈旧条目
+    const wSock = global.__io?.sockets.sockets.get(w.socketId);
+    if (!wSock) {
+      waitingQueue.splice(i, 1);
+      i--; // 索引前移
+      continue;
+    }
     // 配对成功
     waitingQueue.splice(i, 1);
     // 随机分配黑白
@@ -248,22 +281,37 @@ function tryMatch(socket, user) {
     const blackUser = db.prepare('SELECT id, username FROM users WHERE id = ?').get(blackId);
     const whiteUser = db.prepare('SELECT id, username FROM users WHERE id = ?').get(whiteId);
 
+    // 再次确认两边 socket 都还在(配对过程中可能刚断)
     const s1 = getSocketByUserId(blackId);
     const s2 = getSocketByUserId(whiteId);
-    if (s1) {
-      s1.emit('match_success', {
-        gameId,
-        color: 'black',
-        opponent: { id: whiteUser.id, username: whiteUser.username },
-      });
+    if (!s1 || !s2) {
+      console.log(`[tryMatch] socket missing after pair: black=${!!s1} white=${!!s2}, abort game=${gameId}`);
+      // 撤销刚创建的对局（标记为取消）
+      try {
+        db.prepare(`UPDATE games SET status = 'finished', finished_at = CURRENT_TIMESTAMP WHERE id = ?`).run(gameId);
+      } catch (_) {}
+      // 找到仍然在线的那位，重新放回队列
+      const survivorId = s1 ? blackId : s2 ? whiteId : null;
+      if (survivorId) {
+        const survivorUser = db.prepare('SELECT id, username FROM users WHERE id = ?').get(survivorId);
+        const survivorSock = getSocketByUserId(survivorId);
+        if (survivorUser && survivorSock) {
+          waitingQueue.push({ userId: survivorUser.id, username: survivorUser.username, socketId: survivorSock.id });
+          survivorSock.emit('match_waiting');
+        }
+      }
+      return;
     }
-    if (s2) {
-      s2.emit('match_success', {
-        gameId,
-        color: 'white',
-        opponent: { id: blackUser.id, username: blackUser.username },
-      });
-    }
+    s1.emit('match_success', {
+      gameId,
+      color: 'black',
+      opponent: { id: whiteUser.id, username: whiteUser.username },
+    });
+    s2.emit('match_success', {
+      gameId,
+      color: 'white',
+      opponent: { id: blackUser.id, username: blackUser.username },
+    });
     // 启动黑方思考计时器
     setTimeout(() => startTurnTimer(gameId), 200);
     return;
@@ -619,6 +667,11 @@ function respondRematch(socket, user, { fromUserId, accept, gameId }) {
     socket.emit('error', { message: '对方已离线，无法开始新对局' });
     return;
   }
+  // 关键:自己也必须在线(响应者就是 socket,理论上在线,但保险起见再确认)
+  if (!socket) {
+    if (fromSock) fromSock.emit('error', { message: '对方已离线，无法开始新对局' });
+    return;
+  }
   // 随机分配黑白（与上局相反增加趣味）
   let blackId, whiteId;
   if (Math.random() < 0.5) {
@@ -629,14 +682,12 @@ function respondRematch(socket, user, { fromUserId, accept, gameId }) {
   const newGameId = createGame(blackId, whiteId);
   const blackUser = db.prepare('SELECT id, username FROM users WHERE id = ?').get(blackId);
   const whiteUser = db.prepare('SELECT id, username FROM users WHERE id = ?').get(whiteId);
-  if (fromSock) {
-    fromSock.emit('match_success', {
-      gameId: newGameId,
-      color: blackId === fromId ? 'black' : 'white',
-      opponent: { id: user.id, username: user.username },
-      via: 'rematch',
-    });
-  }
+  fromSock.emit('match_success', {
+    gameId: newGameId,
+    color: blackId === fromId ? 'black' : 'white',
+    opponent: { id: user.id, username: user.username },
+    via: 'rematch',
+  });
   socket.emit('match_success', {
     gameId: newGameId,
     color: blackId === user.id ? 'black' : 'white',
@@ -703,6 +754,11 @@ function respondInvite(socket, user, { fromUserId, accept }) {
     // 双方先退出各自等待队列
     cancelMatch(fromId);
     cancelMatch(user.id);
+    // 双方必须都还在线
+    if (!fromSock) {
+      socket.emit('error', { message: '对方已离线，无法开始新对局' });
+      return;
+    }
     // 随机分配黑白
     let blackId, whiteId;
     if (Math.random() < 0.5) {
@@ -713,14 +769,12 @@ function respondInvite(socket, user, { fromUserId, accept }) {
     const gameId = createGame(blackId, whiteId);
     const blackUser = db.prepare('SELECT id, username FROM users WHERE id = ?').get(blackId);
     const whiteUser = db.prepare('SELECT id, username FROM users WHERE id = ?').get(whiteId);
-    if (fromSock) {
-      fromSock.emit('match_success', {
-        gameId,
-        color: blackId === fromId ? 'black' : 'white',
-        opponent: { id: user.id, username: user.username },
-        via: 'invite',
-      });
-    }
+    fromSock.emit('match_success', {
+      gameId,
+      color: blackId === fromId ? 'black' : 'white',
+      opponent: { id: user.id, username: user.username },
+      via: 'invite',
+    });
     socket.emit('match_success', {
       gameId,
       color: blackId === user.id ? 'black' : 'white',
