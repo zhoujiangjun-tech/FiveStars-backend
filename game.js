@@ -131,7 +131,7 @@ function unregisterSocket(socket) {
       if (fromSock) fromSock.emit('rematch_cancelled', { reason: 'offline' });
     }
   }
-  // 用户真正下线时,通知对局中的对手
+  // 用户真正下线时,通知对局中的对手(但只通知"已经进入对局"的用户,否则会误报)
   if (userId) {
     try {
       const rows = db.prepare(
@@ -139,6 +139,12 @@ function unregisterSocket(socket) {
          WHERE status = 'playing' AND (player_black_id = ? OR player_white_id = ?)`
       ).all(userId, userId);
       for (const g of rows) {
+        // 关键:断线用户必须自己已经进入过对局,才会去通知对手
+        // 否则会出现"对手收到 match_success 但根本没进棋盘 -> 短时断线 -> 自己被通知'对手已离开'"的 bug
+        if (!hasUserJoinedGame(g.id, userId)) {
+          console.log(`[unregisterSocket] user=${userId} never joined game=${g.id}, skip notify`);
+          continue;
+        }
         const opponentId = g.player_black_id === userId ? g.player_white_id : g.player_black_id;
         const opSock = getSocketByUserId(opponentId);
         if (opSock) {
@@ -327,6 +333,36 @@ function cancelMatch(userId) {
     if (waitingQueue[i].userId === userId) {
       waitingQueue.splice(i, 1);
     }
+  }
+}
+
+// 进入对局确认:防止"对手收到 match_success 但根本没进棋盘"导致 unregisterSocket 误判对手离线
+// 用一个 Set 记录"已经进入对局屏幕"的用户,只有当 userId 真正进入过对局,
+// 后续这个 user 断线才会被算作"比赛中离线"去通知对手
+const joinedGames = new Set(); // 元素为 `${gameId}:${userId}`
+
+function markUserJoinedGame(gameId, userId) {
+  joinedGames.add(`${gameId}:${userId}`);
+  // 双方都进入 -> 真正开始计时
+  const game = getGame(gameId);
+  if (game && joinedGames.has(`${gameId}:${game.player_black_id}`) && joinedGames.has(`${gameId}:${game.player_white_id}`)) {
+    const black = getSocketByUserId(game.player_black_id);
+    const white = getSocketByUserId(game.player_white_id);
+    const payload = { gameId, bothReady: true };
+    if (black) black.emit('game_ready', payload);
+    if (white) white.emit('game_ready', payload);
+    // 启动第一个回合计时器
+    setTimeout(() => startTurnTimer(gameId), 100);
+  }
+}
+
+function hasUserJoinedGame(gameId, userId) {
+  return joinedGames.has(`${gameId}:${userId}`);
+}
+
+function cleanupJoinedGame(gameId) {
+  for (const k of Array.from(joinedGames.keys())) {
+    if (k.startsWith(`${gameId}:`)) joinedGames.delete(k);
   }
 }
 
@@ -792,6 +828,8 @@ module.exports = {
   unregisterSocket,
   tryMatch,
   cancelMatch,
+  markUserJoinedGame,
+  cleanupJoinedGame,
   makeMove,
   requestUndo,
   undoResponse,

@@ -321,9 +321,27 @@ io.on('connection', (socket) => {
 
   console.log(`[connect] user=${user.id} ${user.username} sid=${socket.id}`);
   addOnline(user);
+  // 关键:新连接立即推送一次当前在线人数,这样刚加入的客户端不会一直显示 0
+  socket.emit('online_count', { count: onlineUserIds.size });
 
   socket.on('join_match', () => {
     game.tryMatch(socket, user);
+  });
+
+  // 客户端进入对局屏幕后,显式通知服务端"我已经进入" -> 服务端开始记时,
+  // 且后续该用户断线才会被算作"比赛中离线"去通知对手(避免误报)
+  socket.on('join_game', ({ gameId } = {}) => {
+    if (typeof gameId !== 'number') return;
+    try {
+      const g = game.getGame(gameId);
+      if (!g) return;
+      if (g.player_black_id !== user.id && g.player_white_id !== user.id) return;
+      game.markUserJoinedGame(gameId, user.id);
+      // 通知客户端:这一局是否另一方已经进入(用于显示"对手正在进入"等)
+      const opponentId = g.player_black_id === user.id ? g.player_white_id : g.player_black_id;
+      const opReady = game.hasUserJoinedGame(gameId, opponentId);
+      socket.emit('join_game_ack', { gameId, bothReady: opReady && game.hasUserJoinedGame(gameId, user.id) });
+    } catch (_) {}
   });
 
   socket.on('cancel_match', () => {
